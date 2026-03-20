@@ -1,0 +1,1679 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+APP_DIR="${PAPERCLIP_APP_DIR:-$ROOT_DIR/vendor/paperclip}"
+UPSTREAM_REPO="${PAPERCLIP_UPSTREAM_REPO:-https://github.com/paperclipai/paperclip.git}"
+RUNTIME_DIR="${PAPERCLIP_RUNTIME_DIR:-$ROOT_DIR/.paperclip-runtime}"
+DATA_DIR="$RUNTIME_DIR/home"
+RUN_DIR="$RUNTIME_DIR/run"
+LOG_DIR="$RUNTIME_DIR/logs"
+ENV_FILE="$RUNTIME_DIR/paperclip.env"
+LOG_FILE="$LOG_DIR/paperclip.log"
+INVITE_FILE="$RUNTIME_DIR/bootstrap-invite.txt"
+INSTANCE_ROOT="$DATA_DIR/instances/default"
+CONFIG_FILE="$INSTANCE_ROOT/config.json"
+INSTANCE_ENV_FILE="$INSTANCE_ROOT/.env"
+SECRETS_KEY_FILE="$INSTANCE_ROOT/secrets/master.key"
+PROJECT_SLUG="$(basename "$ROOT_DIR" | tr '[:upper:]' '[:lower:]' | tr -cs 'a-z0-9' '-')"
+PROJECT_SLUG="${PROJECT_SLUG#-}"
+PROJECT_SLUG="${PROJECT_SLUG%-}"
+LAUNCH_LABEL="ai.paperclip.${PROJECT_SLUG:-paperclip}"
+PLIST_FILE="$RUNTIME_DIR/${LAUNCH_LABEL}.plist"
+PORT="${PORT:-3100}"
+HOST="${HOST:-127.0.0.1}"
+PUBLIC_PORT="${PAPERCLIP_PUBLIC_PORT:-8443}"
+DB_PORT="${PAPERCLIP_DB_PORT:-$((54329 + PORT - 3100))}"
+DEPLOYMENT_MODE="${PAPERCLIP_DEPLOYMENT_MODE:-authenticated}"
+DEPLOYMENT_EXPOSURE="${PAPERCLIP_DEPLOYMENT_EXPOSURE:-private}"
+ENABLE_TAILSCALE="${PAPERCLIP_ENABLE_TAILSCALE:-auto}"
+USE_TAILSCALE="0"
+TAILSCALE_DNS_NAME=""
+TAILSCALE_SHORT_NAME=""
+TAILSCALE_IP=""
+
+usage() {
+  cat <<'EOF'
+Usage:
+  ./paperclip start
+  ./paperclip stop
+  ./paperclip status
+  ./paperclip doctor
+  ./paperclip agent list [--tree]
+  ./paperclip agent heartbeat set <agent-name-or-id> <seconds|Ns|Nm|Nh> [--self|--self-and-reports] [--dry-run]
+  ./paperclip agent thinking set <agent-name-or-id> <minimal|low|medium|high|xhigh> [--self|--self-and-reports] [--dry-run]
+
+Commands:
+  start   Bootstrap upstream Paperclip if needed and start the managed daemon
+  stop    Stop the managed Paperclip process
+  status  Show daemon status, health, and runtime paths
+  doctor  Show platform, dependency, and networking diagnostics
+  agent   Agent control commands
+
+Examples:
+  ./paperclip doctor
+  ./paperclip start
+  PAPERCLIP_ENABLE_TAILSCALE=never ./paperclip start
+  ./paperclip agent list --tree
+  ./paperclip agent heartbeat set CEO 3m
+  ./paperclip agent thinking set CEO xhigh --self
+EOF
+}
+
+log() {
+  printf '[paperclip] %s\n' "$*"
+}
+
+fail() {
+  printf '[paperclip] ERROR: %s\n' "$*" >&2
+  exit 1
+}
+
+agent_usage() {
+  cat <<'EOF'
+Usage:
+  ./paperclip agent list [--tree]
+  ./paperclip agent heartbeat set <agent-name-or-id> <seconds|Ns|Nm|Nh> [--self|--self-and-reports] [--dry-run]
+  ./paperclip agent thinking set <agent-name-or-id> <minimal|low|medium|high|xhigh> [--self|--self-and-reports] [--dry-run]
+
+Commands:
+  list           List agents in the live Paperclip instance
+  heartbeat set  Set heartbeat interval for one agent or its full reporting subtree
+  thinking set   Set modelReasoningEffort for one agent or its full reporting subtree
+
+Options:
+  --tree               Show agents as an org tree instead of a flat list
+  --self               Apply only to the target agent
+  --self-and-reports   Apply to the target agent and all descendants in its reporting tree
+  --include-reports    Alias for --self-and-reports
+  --dry-run            Show which agents would change without updating anything
+EOF
+}
+
+ensure_dirs() {
+  mkdir -p "$RUNTIME_DIR" "$DATA_DIR" "$RUN_DIR" "$LOG_DIR" "$INSTANCE_ROOT"
+}
+
+require_command() {
+  local command_name="$1"
+  local help_text="${2:-}"
+
+  if command -v "$command_name" >/dev/null 2>&1; then
+    return 0
+  fi
+
+  if [[ -n "$help_text" ]]; then
+    fail "$command_name is required ($help_text)"
+  fi
+  fail "$command_name is required"
+}
+
+require_macos() {
+  if [[ "$(uname -s)" != "Darwin" ]]; then
+    fail "This wrapper currently supports macOS only because it manages Paperclip with launchd"
+  fi
+}
+
+resolve_tailscale_metadata() {
+  TAILSCALE_DNS_NAME=""
+  TAILSCALE_SHORT_NAME=""
+  TAILSCALE_IP=""
+
+  if ! command -v tailscale >/dev/null 2>&1; then
+    return 0
+  fi
+
+  local status_json
+  if ! status_json="$(tailscale status --json 2>/dev/null)"; then
+    return 0
+  fi
+
+  local parsed
+  parsed="$(python3 -c '
+import json
+import sys
+
+data = json.load(sys.stdin)
+self_node = data.get("Self") or {}
+dns_name = (self_node.get("DNSName") or "").rstrip(".")
+short_name = dns_name.split(".", 1)[0] if dns_name else ""
+ipv4 = ""
+for value in self_node.get("TailscaleIPs") or []:
+    if "." in value:
+        ipv4 = value
+        break
+print(dns_name)
+print(short_name)
+print(ipv4)
+' <<<"$status_json")"
+
+  TAILSCALE_DNS_NAME="$(printf '%s\n' "$parsed" | sed -n '1p')"
+  TAILSCALE_SHORT_NAME="$(printf '%s\n' "$parsed" | sed -n '2p')"
+  TAILSCALE_IP="$(printf '%s\n' "$parsed" | sed -n '3p')"
+}
+
+compute_network_mode() {
+  local requested
+  requested="$(printf '%s' "$ENABLE_TAILSCALE" | tr '[:upper:]' '[:lower:]')"
+
+  resolve_tailscale_metadata
+  USE_TAILSCALE="0"
+
+  case "$requested" in
+    auto)
+      if command -v tailscale >/dev/null 2>&1 && [[ -n "$TAILSCALE_DNS_NAME" || -n "$TAILSCALE_IP" ]]; then
+        USE_TAILSCALE="1"
+      fi
+      ;;
+    always|true|1|yes)
+      command -v tailscale >/dev/null 2>&1 || fail "tailscale is required when PAPERCLIP_ENABLE_TAILSCALE=$ENABLE_TAILSCALE"
+      [[ -n "$TAILSCALE_DNS_NAME" || -n "$TAILSCALE_IP" ]] || fail "tailscale is installed but this machine does not appear to have an active tailnet identity"
+      USE_TAILSCALE="1"
+      ;;
+    never|false|0|no)
+      USE_TAILSCALE="0"
+      ;;
+    *)
+      fail "Unsupported PAPERCLIP_ENABLE_TAILSCALE value '$ENABLE_TAILSCALE'. Expected auto, always, or never"
+      ;;
+  esac
+}
+
+join_unique_csv() {
+  printf '%s\n' "$@" | awk 'NF && !seen[$0]++' | paste -sd, -
+}
+
+write_managed_env() {
+  compute_network_mode
+
+  local public_host="${PAPERCLIP_PUBLIC_HOST:-}"
+  if [[ -z "$public_host" ]]; then
+    if [[ "$USE_TAILSCALE" == "1" ]]; then
+      if [[ -n "$TAILSCALE_DNS_NAME" ]]; then
+        public_host="$TAILSCALE_DNS_NAME"
+      elif [[ -n "$TAILSCALE_IP" ]]; then
+        public_host="$TAILSCALE_IP"
+      else
+        fail "Unable to derive a Tailscale host name or IP"
+      fi
+    elif [[ "$HOST" == "0.0.0.0" ]]; then
+      public_host="127.0.0.1"
+    else
+      public_host="$HOST"
+    fi
+  fi
+
+  local public_scheme="http"
+  local effective_public_port="$PORT"
+  if [[ "$USE_TAILSCALE" == "1" ]]; then
+    public_scheme="https"
+    effective_public_port="$PUBLIC_PORT"
+  fi
+
+  local public_url="${PAPERCLIP_PUBLIC_URL:-$public_scheme://$public_host:$effective_public_port}"
+  local allowed_hostnames
+  allowed_hostnames="$(join_unique_csv \
+    "${PAPERCLIP_ALLOWED_HOSTNAMES:-}" \
+    "$public_host" \
+    "$HOST" \
+    "127.0.0.1" \
+    "localhost" \
+    "${TAILSCALE_DNS_NAME:-}" \
+    "${TAILSCALE_SHORT_NAME:-}" \
+    "${TAILSCALE_IP:-}")"
+
+  cat >"$ENV_FILE" <<EOF
+HOST=$HOST
+PORT=$PORT
+SERVE_UI=true
+PAPERCLIP_DEPLOYMENT_MODE=$DEPLOYMENT_MODE
+PAPERCLIP_DEPLOYMENT_EXPOSURE=$DEPLOYMENT_EXPOSURE
+PAPERCLIP_PUBLIC_URL=$public_url
+PAPERCLIP_ALLOWED_HOSTNAMES=$allowed_hostnames
+PAPERCLIP_ENABLE_TAILSCALE=$ENABLE_TAILSCALE
+PAPERCLIP_USE_TAILSCALE=$USE_TAILSCALE
+PAPERCLIP_DB_PORT=$DB_PORT
+PAPERCLIP_UPSTREAM_REPO=$UPSTREAM_REPO
+PAPERCLIP_APP_DIR=$APP_DIR
+EOF
+}
+
+load_managed_env() {
+  [[ -f "$ENV_FILE" ]] || write_managed_env
+  set -a
+  # shellcheck disable=SC1090
+  source "$ENV_FILE"
+  set +a
+}
+
+config_path() {
+  printf '%s\n' "$CONFIG_FILE"
+}
+
+launch_domain() {
+  printf 'gui/%s\n' "$(id -u)"
+}
+
+launch_target() {
+  printf '%s/%s\n' "$(launch_domain)" "$LAUNCH_LABEL"
+}
+
+launch_is_loaded() {
+  launchctl print "$(launch_target)" >/dev/null 2>&1
+}
+
+pid_is_running() {
+  local pid="$1"
+  kill -0 "$pid" >/dev/null 2>&1
+}
+
+managed_pid() {
+  launchctl print "$(launch_target)" 2>/dev/null \
+    | awk -F'= ' '/pid = / {gsub(/[^0-9]/, "", $2); print $2; exit}'
+}
+
+cleanup_stale_pid() {
+  :
+}
+
+ensure_upstream_checkout() {
+  if [[ -d "$APP_DIR/.git" ]]; then
+    return 0
+  fi
+
+  if [[ -d "$APP_DIR" ]] && [[ -z "$(ls -A "$APP_DIR" 2>/dev/null)" ]]; then
+    rmdir "$APP_DIR"
+  fi
+
+  if [[ -e "$APP_DIR" ]]; then
+    fail "Expected PAPERCLIP_APP_DIR '$APP_DIR' to be either absent or a git checkout"
+  fi
+
+  require_command git "install Xcode command line tools or Homebrew git"
+  mkdir -p "$(dirname "$APP_DIR")"
+  log "Cloning upstream Paperclip from $UPSTREAM_REPO into $APP_DIR ..."
+  git clone --depth 1 "$UPSTREAM_REPO" "$APP_DIR"
+}
+
+ensure_dependencies() {
+  require_command node "Node.js 20+"
+  require_command pnpm "pnpm 9.x"
+  require_command python3 "Python 3"
+  require_command curl "curl is used for health checks"
+  require_command lsof "lsof is used for local port checks"
+
+  if [[ ! -d "$APP_DIR/node_modules" ]]; then
+    log "Installing Paperclip dependencies..."
+    (
+      cd "$APP_DIR"
+      pnpm install --frozen-lockfile
+    )
+  fi
+
+  log "Building plugin SDK prerequisite..."
+  (
+    cd "$APP_DIR"
+    pnpm --filter @paperclipai/plugin-sdk build >/dev/null
+  )
+}
+
+write_instance_env_if_missing() {
+  if [[ -f "$INSTANCE_ENV_FILE" ]]; then
+    return 0
+  fi
+
+  python3 - "$INSTANCE_ENV_FILE" <<'PY'
+import os
+import pathlib
+import secrets
+import sys
+
+target = pathlib.Path(sys.argv[1])
+target.parent.mkdir(parents=True, exist_ok=True)
+target.write_text(
+    "# Paperclip environment variables\n"
+    "# Generated by paperclip_cli\n"
+    f"PAPERCLIP_AGENT_JWT_SECRET={secrets.token_hex(32)}\n",
+    encoding="utf-8",
+)
+os.chmod(target, 0o600)
+PY
+}
+
+write_secrets_key_if_missing() {
+  if [[ -f "$SECRETS_KEY_FILE" ]]; then
+    return 0
+  fi
+
+  python3 - "$SECRETS_KEY_FILE" <<'PY'
+import base64
+import os
+import pathlib
+import secrets
+import sys
+
+target = pathlib.Path(sys.argv[1])
+target.parent.mkdir(parents=True, exist_ok=True)
+target.write_text(base64.b64encode(secrets.token_bytes(32)).decode("ascii"), encoding="utf-8")
+os.chmod(target, 0o600)
+PY
+}
+
+write_managed_config() {
+  local should_log="0"
+  if [[ ! -f "$CONFIG_FILE" ]]; then
+    should_log="1"
+  fi
+
+  if [[ "$should_log" == "1" ]]; then
+    log "Writing managed Paperclip config in $INSTANCE_ROOT ..."
+  fi
+
+  python3 - "$CONFIG_FILE" "$INSTANCE_ROOT" "$HOST" "$PORT" "$DB_PORT" "$PAPERCLIP_PUBLIC_URL" "$PAPERCLIP_ALLOWED_HOSTNAMES" "$SECRETS_KEY_FILE" "$DEPLOYMENT_MODE" "$DEPLOYMENT_EXPOSURE" <<'PY'
+import json
+import pathlib
+import sys
+from datetime import datetime, timezone
+
+config_path = pathlib.Path(sys.argv[1])
+instance_root = pathlib.Path(sys.argv[2])
+host = sys.argv[3]
+port = int(sys.argv[4])
+db_port = int(sys.argv[5])
+public_url = sys.argv[6]
+allowed_hostnames = [value for value in sys.argv[7].split(",") if value]
+secrets_key_file = sys.argv[8]
+deployment_mode = sys.argv[9]
+deployment_exposure = sys.argv[10]
+
+existing = {}
+if config_path.exists():
+    try:
+        loaded = json.loads(config_path.read_text(encoding="utf-8"))
+        if isinstance(loaded, dict):
+            existing = loaded
+    except Exception:
+        existing = {}
+
+existing["$meta"] = {
+    "version": 1,
+    "updatedAt": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+    "source": "paperclip_cli",
+}
+existing["database"] = {
+    "mode": "embedded-postgres",
+    "embeddedPostgresDataDir": str(instance_root / "db"),
+    "embeddedPostgresPort": db_port,
+    "backup": {
+        "enabled": True,
+        "intervalMinutes": 60,
+        "retentionDays": 30,
+        "dir": str(instance_root / "data" / "backups"),
+    },
+}
+existing["logging"] = {
+    "mode": "file",
+    "logDir": str(instance_root / "logs"),
+}
+existing["server"] = {
+    "deploymentMode": deployment_mode,
+    "exposure": deployment_exposure,
+    "host": host,
+    "port": port,
+    "allowedHostnames": allowed_hostnames,
+    "serveUi": True,
+}
+existing["auth"] = {
+    "baseUrlMode": "explicit",
+    "disableSignUp": False,
+    "publicBaseUrl": public_url,
+}
+existing["storage"] = {
+    "provider": "local_disk",
+    "localDisk": {
+        "baseDir": str(instance_root / "data" / "storage"),
+    },
+    "s3": {
+        "bucket": "paperclip",
+        "region": "us-east-1",
+        "prefix": "",
+        "forcePathStyle": False,
+    },
+}
+existing["secrets"] = {
+    "provider": "local_encrypted",
+    "strictMode": False,
+    "localEncrypted": {
+        "keyFilePath": secrets_key_file,
+    },
+}
+
+config_path.parent.mkdir(parents=True, exist_ok=True)
+config_path.write_text(json.dumps(existing, indent=2) + "\n", encoding="utf-8")
+PY
+  chmod 600 "$CONFIG_FILE"
+}
+
+ensure_config() {
+  write_instance_env_if_missing
+  write_secrets_key_if_missing
+  write_managed_config
+}
+
+port_listener_pid() {
+  lsof -tiTCP:"$PORT" -sTCP:LISTEN 2>/dev/null | head -n 1 || true
+}
+
+ensure_port_available() {
+  local listener_pid
+  listener_pid="$(port_listener_pid)"
+  if [[ -z "$listener_pid" ]]; then
+    return 0
+  fi
+
+  local current_pid
+  current_pid="$(managed_pid || true)"
+  if [[ -n "$current_pid" && "$listener_pid" == "$current_pid" ]]; then
+    return 0
+  fi
+
+  fail "Port $PORT is already in use by pid $listener_pid"
+}
+
+ensure_tailscale_serve() {
+  if [[ "${PAPERCLIP_USE_TAILSCALE:-0}" != "1" ]]; then
+    return 0
+  fi
+
+  require_command tailscale "needed for PAPERCLIP_ENABLE_TAILSCALE=$ENABLE_TAILSCALE"
+  log "Ensuring Tailscale Serve maps https://<this-node>:$PUBLIC_PORT -> http://127.0.0.1:$PORT ..."
+  tailscale serve --yes --bg --https "$PUBLIC_PORT" "$PORT" >/dev/null
+}
+
+write_launchd_plist() {
+  local node_bin
+  node_bin="$(command -v node)"
+
+  python3 - "$PLIST_FILE" "$LAUNCH_LABEL" "$APP_DIR" "$node_bin" "$LOG_FILE" "$CONFIG_FILE" "$DATA_DIR" "$INSTANCE_ROOT" "$HOST" "$PORT" "$PAPERCLIP_PUBLIC_URL" "$PAPERCLIP_ALLOWED_HOSTNAMES" "$DEPLOYMENT_MODE" "$DEPLOYMENT_EXPOSURE" <<'PY'
+import os
+import plistlib
+import sys
+
+(
+    plist_path,
+    label,
+    app_dir,
+    node_bin,
+    log_file,
+    config_file,
+    data_dir,
+    instance_root,
+    host,
+    port,
+    public_url,
+    allowed_hostnames,
+    deployment_mode,
+    deployment_exposure,
+) = sys.argv[1:]
+
+env = {
+    "HOME": os.environ.get("HOME", ""),
+    "PATH": os.environ.get("PATH", ""),
+    "HOST": host,
+    "PORT": port,
+    "SERVE_UI": "true",
+    "PAPERCLIP_CONFIG": config_file,
+    "PAPERCLIP_HOME": data_dir,
+    "PAPERCLIP_INSTANCE_ID": "default",
+    "PAPERCLIP_UI_DEV_MIDDLEWARE": "true",
+    "PAPERCLIP_OPEN_ON_LISTEN": "false",
+    "PAPERCLIP_DEPLOYMENT_MODE": deployment_mode,
+    "PAPERCLIP_DEPLOYMENT_EXPOSURE": deployment_exposure,
+    "PAPERCLIP_PUBLIC_URL": public_url,
+    "PAPERCLIP_ALLOWED_HOSTNAMES": allowed_hostnames,
+}
+
+instance_env_path = os.path.join(instance_root, ".env")
+if os.path.exists(instance_env_path):
+    with open(instance_env_path, "r", encoding="utf-8") as handle:
+        for raw_line in handle:
+            line = raw_line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            env.setdefault(key, value)
+
+plist = {
+    "Label": label,
+    "WorkingDirectory": app_dir,
+    "ProgramArguments": [
+        node_bin,
+        "cli/node_modules/tsx/dist/cli.mjs",
+        "server/src/index.ts",
+    ],
+    "EnvironmentVariables": env,
+    "RunAtLoad": True,
+    "KeepAlive": True,
+    "ProcessType": "Interactive",
+    "StandardOutPath": log_file,
+    "StandardErrorPath": log_file,
+}
+
+os.makedirs(os.path.dirname(plist_path), exist_ok=True)
+with open(plist_path, "wb") as handle:
+    plistlib.dump(plist, handle, sort_keys=True)
+PY
+}
+
+health_url() {
+  printf '%s\n' "http://127.0.0.1:$PORT/api/health"
+}
+
+wait_for_health() {
+  local attempts=60
+  local url
+  local pid
+  url="$(health_url)"
+  for _ in $(seq 1 "$attempts"); do
+    if curl -fsS --max-time 2 "$url" >/dev/null 2>&1; then
+      return 0
+    fi
+    pid="$(managed_pid || true)"
+    if [[ -n "$pid" ]] && ! pid_is_running "$pid"; then
+      return 1
+    fi
+    sleep 1
+  done
+  return 1
+}
+
+refresh_bootstrap_invite() {
+  local output_file="$INVITE_FILE"
+  local output
+  output="$(
+    cd "$APP_DIR"
+    export PAPERCLIP_CONFIG="$CONFIG_FILE"
+    export PAPERCLIP_HOME="$DATA_DIR"
+    export PAPERCLIP_INSTANCE_ID="default"
+    export PAPERCLIP_PUBLIC_URL
+    node cli/node_modules/tsx/dist/cli.mjs cli/src/index.ts auth bootstrap-ceo --config "$CONFIG_FILE" --base-url "$PAPERCLIP_PUBLIC_URL" 2>&1 || true
+  )"
+  printf '%s\n' "$output" >"$output_file"
+  chmod 600 "$output_file"
+}
+
+show_status() {
+  require_macos
+  cleanup_stale_pid
+  ensure_dirs
+  write_managed_env
+  load_managed_env
+
+  local pid
+  pid="$(managed_pid || true)"
+  if [[ -z "$pid" ]]; then
+    log "Status: stopped"
+    log "Network mode: $( [[ "${PAPERCLIP_USE_TAILSCALE:-0}" == "1" ]] && printf 'tailscale' || printf 'local' )"
+    log "App dir: $APP_DIR"
+    log "Data dir: $DATA_DIR"
+    log "Env file: $ENV_FILE"
+    log "Log file: $LOG_FILE"
+    return 1
+  fi
+
+  if ! pid_is_running "$pid"; then
+    log "Status: stopped (launchd target exists but no live pid)"
+    log "App dir: $APP_DIR"
+    log "Data dir: $DATA_DIR"
+    log "Env file: $ENV_FILE"
+    log "Log file: $LOG_FILE"
+    return 1
+  fi
+
+  local health_state="unhealthy"
+  if curl -fsS --max-time 2 "$(health_url)" >/dev/null 2>&1; then
+    health_state="healthy"
+  fi
+
+  log "Status: running"
+  log "PID: $pid"
+  log "Health: $health_state"
+  log "Network mode: $( [[ "${PAPERCLIP_USE_TAILSCALE:-0}" == "1" ]] && printf 'tailscale' || printf 'local' )"
+  log "URL: ${PAPERCLIP_PUBLIC_URL:-http://127.0.0.1:$PORT}"
+  log "App dir: $APP_DIR"
+  log "Data dir: $DATA_DIR"
+  log "Env file: $ENV_FILE"
+  log "Log file: $LOG_FILE"
+  if [[ -f "$INVITE_FILE" ]]; then
+    log "Invite file: $INVITE_FILE"
+  fi
+}
+
+doctor() {
+  ensure_dirs
+  write_managed_env
+  load_managed_env
+
+  log "Platform: $(uname -s)"
+  log "Repo root: $ROOT_DIR"
+  log "App dir: $APP_DIR"
+  log "Upstream repo: $UPSTREAM_REPO"
+  log "Runtime dir: $RUNTIME_DIR"
+  log "Config path: $(config_path)"
+  log "DB port: $DB_PORT"
+  log "Network mode: $( [[ "${PAPERCLIP_USE_TAILSCALE:-0}" == "1" ]] && printf 'tailscale' || printf 'local' )"
+  log "Public URL: ${PAPERCLIP_PUBLIC_URL:-http://127.0.0.1:$PORT}"
+
+  if command -v node >/dev/null 2>&1; then
+    log "node: $(command -v node) ($(node --version))"
+  else
+    log "node: missing"
+  fi
+
+  if command -v pnpm >/dev/null 2>&1; then
+    log "pnpm: $(command -v pnpm) ($(pnpm --version))"
+  else
+    log "pnpm: missing"
+  fi
+
+  if command -v python3 >/dev/null 2>&1; then
+    log "python3: $(command -v python3) ($(python3 --version 2>&1))"
+  else
+    log "python3: missing"
+  fi
+
+  if command -v git >/dev/null 2>&1; then
+    log "git: $(command -v git) ($(git --version))"
+  else
+    log "git: missing"
+  fi
+
+  if command -v curl >/dev/null 2>&1; then
+    log "curl: $(command -v curl)"
+  else
+    log "curl: missing"
+  fi
+
+  if command -v psql >/dev/null 2>&1; then
+    log "psql: $(command -v psql)"
+  else
+    log "psql: missing (only needed for agent commands)"
+  fi
+
+  if command -v tailscale >/dev/null 2>&1; then
+    log "tailscale: $(command -v tailscale)"
+    if [[ -n "$TAILSCALE_DNS_NAME" || -n "$TAILSCALE_IP" ]]; then
+      log "tailnet identity: ${TAILSCALE_DNS_NAME:-$TAILSCALE_IP}"
+    else
+      log "tailnet identity: unavailable"
+    fi
+  else
+    log "tailscale: missing (local-only mode will be used)"
+  fi
+
+  if [[ -d "$APP_DIR/.git" ]]; then
+    log "Upstream checkout: present"
+  else
+    log "Upstream checkout: missing (it will be cloned on ./paperclip start)"
+  fi
+}
+
+start_daemon() {
+  require_macos
+  ensure_dirs
+  cleanup_stale_pid
+  write_managed_env
+  load_managed_env
+
+  local pid
+  pid="$(managed_pid || true)"
+  if [[ -n "$pid" ]] && pid_is_running "$pid"; then
+    show_status
+    return 0
+  fi
+
+  ensure_upstream_checkout
+  ensure_dependencies
+  ensure_port_available
+  ensure_config
+  ensure_tailscale_serve
+  write_launchd_plist
+
+  log "Starting Paperclip daemon..."
+  : >"$LOG_FILE"
+  if launch_is_loaded; then
+    launchctl bootout "$(launch_target)" >/dev/null 2>&1 || launchctl bootout "$(launch_domain)" "$PLIST_FILE" >/dev/null 2>&1 || true
+  fi
+  launchctl bootstrap "$(launch_domain)" "$PLIST_FILE"
+  launchctl kickstart -k "$(launch_target)" >/dev/null 2>&1 || true
+
+  if ! wait_for_health; then
+    log "Startup failed. Recent log output:"
+    tail -n 80 "$LOG_FILE" >&2 || true
+    exit 1
+  fi
+
+  pid="$(managed_pid || true)"
+  refresh_bootstrap_invite
+  log "Started pid $pid"
+  log "URL: ${PAPERCLIP_PUBLIC_URL:-http://127.0.0.1:$PORT}"
+  log "Health: $(health_url)"
+  log "Log: $LOG_FILE"
+  if [[ -f "$INVITE_FILE" ]]; then
+    log "Invite: $INVITE_FILE"
+  fi
+}
+
+stop_daemon() {
+  require_macos
+  cleanup_stale_pid
+
+  if ! launch_is_loaded; then
+    log "Paperclip is not running"
+    return 0
+  fi
+
+  log "Stopping $LAUNCH_LABEL ..."
+  launchctl bootout "$(launch_target)" >/dev/null 2>&1 || launchctl bootout "$(launch_domain)" "$PLIST_FILE" >/dev/null 2>&1 || fail "launchctl bootout failed"
+  log "Stopped"
+}
+
+require_running_instance() {
+  require_macos
+  write_managed_env
+  load_managed_env
+
+  [[ -f "$CONFIG_FILE" ]] || fail "Paperclip config not found at $CONFIG_FILE"
+  command -v psql >/dev/null 2>&1 || fail "psql is required for agent commands"
+
+  local pid
+  pid="$(managed_pid || true)"
+  if [[ -z "$pid" ]]; then
+    fail "Paperclip is not running. Start it with ./paperclip start"
+  fi
+  if ! pid_is_running "$pid"; then
+    fail "Paperclip is not running. Start it with ./paperclip start"
+  fi
+}
+
+read_db_settings() {
+  local parsed
+  parsed="$(python3 - "$CONFIG_FILE" <<'PY'
+import json
+import pathlib
+import sys
+
+config_path = pathlib.Path(sys.argv[1])
+config = json.loads(config_path.read_text(encoding="utf-8"))
+database = config.get("database") or {}
+print(database.get("mode", ""))
+print(database.get("embeddedPostgresPort", 54329))
+print(database.get("embeddedPostgresDataDir", ""))
+PY
+)"
+
+  DB_MODE="$(printf '%s\n' "$parsed" | sed -n '1p')"
+  DB_PORT="$(printf '%s\n' "$parsed" | sed -n '2p')"
+  DB_DATA_DIR="$(printf '%s\n' "$parsed" | sed -n '3p')"
+
+  if [[ "$DB_MODE" != "embedded-postgres" ]]; then
+    fail "agent commands currently support only the embedded-postgres runtime mode managed by this wrapper"
+  fi
+
+  local postmaster_pid_file
+  postmaster_pid_file="$DB_DATA_DIR/postmaster.pid"
+  if [[ -f "$postmaster_pid_file" ]]; then
+    local runtime_port
+    runtime_port="$(sed -n '4p' "$postmaster_pid_file" | tr -d '[:space:]')"
+    if [[ "$runtime_port" =~ ^[0-9]+$ ]]; then
+      DB_PORT="$runtime_port"
+    fi
+  fi
+}
+
+psql_paperclip() {
+  read_db_settings
+  PGPASSWORD="paperclip" psql -X -h 127.0.0.1 -p "$DB_PORT" -U paperclip -d paperclip "$@"
+}
+
+normalize_thinking_level() {
+  local level
+  level="$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')"
+
+  case "$level" in
+    minimal|low|medium|high|xhigh)
+      printf '%s\n' "$level"
+      ;;
+    *)
+      fail "Unsupported thinking level '$1'. Expected one of: minimal, low, medium, high, xhigh"
+      ;;
+  esac
+}
+
+normalize_heartbeat_interval() {
+  local raw
+  local value
+  local unit
+
+  raw="$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')"
+
+  if [[ "$raw" =~ ^[0-9]+$ ]]; then
+    printf '%s\n' "$raw"
+    return 0
+  fi
+
+  if [[ "$raw" =~ ^([0-9]+)(s|m|h)$ ]]; then
+    value="${BASH_REMATCH[1]}"
+    unit="${BASH_REMATCH[2]}"
+    case "$unit" in
+      s)
+        printf '%s\n' "$value"
+        ;;
+      m)
+        printf '%s\n' $((value * 60))
+        ;;
+      h)
+        printf '%s\n' $((value * 3600))
+        ;;
+    esac
+    return 0
+  fi
+
+  fail "Unsupported heartbeat interval '$1'. Expected seconds or a duration like 180, 180s, 3m, or 1h"
+}
+
+format_interval_label() {
+  local seconds="${1:-}"
+
+  if [[ -z "$seconds" || "$seconds" == "-" ]]; then
+    printf '%s' "-"
+    return 0
+  fi
+
+  if (( seconds % 3600 == 0 )); then
+    printf '%sh (%ss)' $((seconds / 3600)) "$seconds"
+  elif (( seconds % 60 == 0 )); then
+    printf '%sm (%ss)' $((seconds / 60)) "$seconds"
+  else
+    printf '%ss' "$seconds"
+  fi
+}
+
+count_lines() {
+  if [[ -z "${1:-}" ]]; then
+    printf '0\n'
+    return 0
+  fi
+
+  awk 'END { print NR + 0 }' <<<"$1"
+}
+
+display_value() {
+  if [[ -n "${1:-}" ]]; then
+    printf '%s' "$1"
+  else
+    printf '%s' "-"
+  fi
+}
+
+resolve_agent_target() {
+  local agent_ref="$1"
+  local matches
+  local match_count
+
+  matches="$(
+    psql_paperclip -v ON_ERROR_STOP=1 -v agent_ref="$agent_ref" -At -F $'\t' <<'SQL'
+select id, company_id, name, role, coalesce(title, ''), coalesce(reports_to::text, '')
+from agents
+where id::text = :'agent_ref'
+   or lower(name) = lower(:'agent_ref')
+order by case when id::text = :'agent_ref' then 0 else 1 end, name;
+SQL
+  )"
+
+  match_count="$(count_lines "$matches")"
+  if [[ "$match_count" == "0" ]]; then
+    fail "No agent matched '$agent_ref'"
+  fi
+
+  if [[ "$match_count" != "1" ]]; then
+    log "Multiple agents matched '$agent_ref':"
+    while IFS=$'\t' read -r id company_id name role title reports_to; do
+      printf '  - %s [%s] role=%s company=%s\n' "$name" "$id" "$role" "$company_id"
+    done <<<"$matches"
+    fail "Use the exact agent id to disambiguate"
+  fi
+
+  IFS=$'\t' read -r TARGET_AGENT_ID TARGET_COMPANY_ID TARGET_AGENT_NAME TARGET_AGENT_ROLE TARGET_AGENT_TITLE TARGET_AGENT_REPORTS_TO <<<"$matches"
+}
+
+query_agent_scope() {
+  local include_reports="$1"
+
+  if [[ "$include_reports" == "1" ]]; then
+    psql_paperclip -v ON_ERROR_STOP=1 -v agent_id="$TARGET_AGENT_ID" -At -F $'\t' <<'SQL'
+with recursive subtree as (
+  select
+    a.id,
+    a.company_id,
+    a.name,
+    a.role,
+    a.adapter_type,
+    coalesce(a.adapter_config->>'modelReasoningEffort', '') as reasoning_effort,
+    0 as depth
+  from agents a
+  where a.id = :'agent_id'::uuid
+
+  union all
+
+  select
+    a.id,
+    a.company_id,
+    a.name,
+    a.role,
+    a.adapter_type,
+    coalesce(a.adapter_config->>'modelReasoningEffort', '') as reasoning_effort,
+    subtree.depth + 1 as depth
+  from agents a
+  join subtree on a.reports_to = subtree.id and a.company_id = subtree.company_id
+)
+select id, name, role, adapter_type, reasoning_effort, depth
+from subtree
+order by depth, name;
+SQL
+  else
+    psql_paperclip -v ON_ERROR_STOP=1 -v agent_id="$TARGET_AGENT_ID" -At -F $'\t' <<'SQL'
+select
+  id,
+  name,
+  role,
+  adapter_type,
+  coalesce(adapter_config->>'modelReasoningEffort', '') as reasoning_effort,
+  0 as depth
+from agents
+where id = :'agent_id'::uuid;
+SQL
+  fi
+}
+
+print_agent_scope() {
+  local scope_rows="$1"
+  local id
+  local name
+  local role
+  local adapter_type
+  local reasoning_effort
+  local depth
+  local indent
+  local current_level
+
+  while IFS=$'\t' read -r id name role adapter_type reasoning_effort depth; do
+    [[ -n "$id" ]] || continue
+    indent="$(printf '%*s' $((depth * 2)) '')"
+    current_level="${reasoning_effort:-<unset>}"
+    printf '  %s- %s adapter=%s thinking=%s\n' "$indent" "$name" "$adapter_type" "$current_level"
+  done <<<"$scope_rows"
+}
+
+query_agent_heartbeat_scope() {
+  local include_reports="$1"
+
+  if [[ "$include_reports" == "1" ]]; then
+    psql_paperclip -v ON_ERROR_STOP=1 -v agent_id="$TARGET_AGENT_ID" -At -F $'\t' <<'SQL'
+with recursive subtree as (
+  select
+    a.id,
+    a.company_id,
+    a.name,
+    a.role,
+    a.adapter_type,
+    coalesce(a.runtime_config->'heartbeat'->>'intervalSec', '') as interval_sec,
+    coalesce(a.runtime_config->'heartbeat'->>'enabled', '') as heartbeat_enabled,
+    0 as depth
+  from agents a
+  where a.id = :'agent_id'::uuid
+
+  union all
+
+  select
+    a.id,
+    a.company_id,
+    a.name,
+    a.role,
+    a.adapter_type,
+    coalesce(a.runtime_config->'heartbeat'->>'intervalSec', '') as interval_sec,
+    coalesce(a.runtime_config->'heartbeat'->>'enabled', '') as heartbeat_enabled,
+    subtree.depth + 1 as depth
+  from agents a
+  join subtree on a.reports_to = subtree.id and a.company_id = subtree.company_id
+)
+select id, name, role, adapter_type, interval_sec, heartbeat_enabled, depth
+from subtree
+order by depth, name;
+SQL
+  else
+    psql_paperclip -v ON_ERROR_STOP=1 -v agent_id="$TARGET_AGENT_ID" -At -F $'\t' <<'SQL'
+select
+  id,
+  name,
+  role,
+  adapter_type,
+  coalesce(runtime_config->'heartbeat'->>'intervalSec', '') as interval_sec,
+  coalesce(runtime_config->'heartbeat'->>'enabled', '') as heartbeat_enabled,
+  0 as depth
+from agents
+where id = :'agent_id'::uuid;
+SQL
+  fi
+}
+
+print_agent_heartbeat_scope() {
+  local scope_rows="$1"
+  local id
+  local name
+  local role
+  local adapter_type
+  local interval_sec
+  local heartbeat_enabled
+  local depth
+  local indent
+  local current_interval
+  local enabled_label
+
+  while IFS=$'\t' read -r id name role adapter_type interval_sec heartbeat_enabled depth; do
+    [[ -n "$id" ]] || continue
+    indent="$(printf '%*s' $((depth * 2)) '')"
+    current_interval="$(format_interval_label "$interval_sec")"
+    enabled_label="$(display_value "$heartbeat_enabled")"
+    printf '  %s- %s adapter=%s heartbeat=%s enabled=%s\n' \
+      "$indent" \
+      "$name" \
+      "$adapter_type" \
+      "$current_interval" \
+      "$enabled_label"
+  done <<<"$scope_rows"
+}
+
+query_all_agents_flat() {
+  psql_paperclip -v ON_ERROR_STOP=1 -At -F $'\t' <<'SQL'
+select
+  a.id,
+  a.name,
+  a.role,
+  a.status,
+  a.adapter_type,
+  coalesce(nullif(a.adapter_config->>'model', ''), '-') as model,
+  coalesce(nullif(a.adapter_config->>'modelReasoningEffort', ''), '-') as reasoning_effort,
+  coalesce(nullif(a.runtime_config->'heartbeat'->>'intervalSec', ''), '-') as heartbeat_interval_sec,
+  coalesce(nullif(manager.name, ''), '-') as manager_name,
+  a.company_id::text
+from agents a
+left join agents manager
+  on manager.id = a.reports_to
+ and manager.company_id = a.company_id
+order by lower(a.name), a.created_at;
+SQL
+}
+
+query_all_agents_tree() {
+  psql_paperclip -v ON_ERROR_STOP=1 -At -F $'\t' <<'SQL'
+with recursive org as (
+  select
+    a.id,
+    a.company_id,
+    a.name,
+    a.role,
+    a.status,
+    a.adapter_type,
+    coalesce(nullif(a.adapter_config->>'model', ''), '-') as model,
+    coalesce(nullif(a.adapter_config->>'modelReasoningEffort', ''), '-') as reasoning_effort,
+    coalesce(nullif(a.runtime_config->'heartbeat'->>'intervalSec', ''), '-') as heartbeat_interval_sec,
+    0 as depth,
+    lower(a.name) || ':' || a.id::text as sort_key
+  from agents a
+  where a.reports_to is null
+     or not exists (
+       select 1
+       from agents parent
+       where parent.id = a.reports_to
+         and parent.company_id = a.company_id
+     )
+
+  union all
+
+  select
+    a.id,
+    a.company_id,
+    a.name,
+    a.role,
+    a.status,
+    a.adapter_type,
+    coalesce(nullif(a.adapter_config->>'model', ''), '-') as model,
+    coalesce(nullif(a.adapter_config->>'modelReasoningEffort', ''), '-') as reasoning_effort,
+    coalesce(nullif(a.runtime_config->'heartbeat'->>'intervalSec', ''), '-') as heartbeat_interval_sec,
+    org.depth + 1 as depth,
+    org.sort_key || '/' || lower(a.name) || ':' || a.id::text as sort_key
+  from agents a
+  join org on a.reports_to = org.id and a.company_id = org.company_id
+)
+select
+  id,
+  name,
+  role,
+  status,
+  adapter_type,
+  model,
+  reasoning_effort,
+  heartbeat_interval_sec,
+  depth,
+  company_id::text
+from org
+order by company_id, sort_key;
+SQL
+}
+
+print_agents_flat() {
+  local rows="$1"
+  local id
+  local name
+  local role
+  local status
+  local adapter_type
+  local model
+  local reasoning_effort
+  local heartbeat_interval_sec
+  local manager_name
+  local company_id
+
+  while IFS=$'\t' read -r id name role status adapter_type model reasoning_effort heartbeat_interval_sec manager_name company_id; do
+    [[ -n "$id" ]] || continue
+    printf '  - %s role=%s status=%s adapter=%s model=%s thinking=%s heartbeat=%s manager=%s\n' \
+      "$name" \
+      "$(display_value "$role")" \
+      "$(display_value "$status")" \
+      "$(display_value "$adapter_type")" \
+      "$(display_value "$model")" \
+      "$(display_value "$reasoning_effort")" \
+      "$(format_interval_label "$heartbeat_interval_sec")" \
+      "$(display_value "$manager_name")"
+  done <<<"$rows"
+}
+
+print_agents_tree() {
+  local rows="$1"
+  local id
+  local name
+  local role
+  local status
+  local adapter_type
+  local model
+  local reasoning_effort
+  local heartbeat_interval_sec
+  local depth
+  local company_id
+  local indent
+
+  while IFS=$'\t' read -r id name role status adapter_type model reasoning_effort heartbeat_interval_sec depth company_id; do
+    [[ -n "$id" ]] || continue
+    indent="$(printf '%*s' $((depth * 2)) '')"
+    printf '  %s- %s role=%s status=%s model=%s thinking=%s heartbeat=%s\n' \
+      "$indent" \
+      "$name" \
+      "$(display_value "$role")" \
+      "$(display_value "$status")" \
+      "$(display_value "$model")" \
+      "$(display_value "$reasoning_effort")" \
+      "$(format_interval_label "$heartbeat_interval_sec")"
+  done <<<"$rows"
+}
+
+agent_list() {
+  local tree="0"
+  local rows
+  local row_count
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --tree)
+        tree="1"
+        ;;
+      -h|--help)
+        agent_usage
+        return 0
+        ;;
+      *)
+        fail "Unknown option: $1"
+        ;;
+    esac
+    shift
+  done
+
+  require_running_instance
+
+  if [[ "$tree" == "1" ]]; then
+    rows="$(query_all_agents_tree)"
+  else
+    rows="$(query_all_agents_flat)"
+  fi
+  row_count="$(count_lines "$rows")"
+
+  if [[ "$tree" == "1" ]]; then
+    log "Agents ($row_count total, tree view):"
+    print_agents_tree "$rows"
+  else
+    log "Agents ($row_count total):"
+    print_agents_flat "$rows"
+  fi
+}
+
+update_agent_thinking_level() {
+  local thinking_level="$1"
+  local include_reports="$2"
+
+  if [[ "$include_reports" == "1" ]]; then
+    psql_paperclip -v ON_ERROR_STOP=1 -v agent_id="$TARGET_AGENT_ID" -v thinking_level="$thinking_level" -At -F $'\t' <<'SQL'
+with recursive subtree as (
+  select a.id, a.company_id
+  from agents a
+  where a.id = :'agent_id'::uuid
+
+  union all
+
+  select a.id, a.company_id
+  from agents a
+  join subtree on a.reports_to = subtree.id and a.company_id = subtree.company_id
+),
+updated as (
+  update agents a
+  set
+    adapter_config = jsonb_set(
+      coalesce(a.adapter_config, '{}'::jsonb),
+      '{modelReasoningEffort}',
+      to_jsonb(:'thinking_level'::text),
+      true
+    ),
+    updated_at = now()
+  from subtree
+  where a.id = subtree.id
+  returning
+    a.id,
+    a.name,
+    a.role,
+    a.adapter_type,
+    coalesce(a.adapter_config->>'modelReasoningEffort', '') as reasoning_effort
+)
+select id, name, role, adapter_type, reasoning_effort
+from updated
+order by name;
+SQL
+  else
+    psql_paperclip -v ON_ERROR_STOP=1 -v agent_id="$TARGET_AGENT_ID" -v thinking_level="$thinking_level" -At -F $'\t' <<'SQL'
+with updated as (
+  update agents a
+  set
+    adapter_config = jsonb_set(
+      coalesce(a.adapter_config, '{}'::jsonb),
+      '{modelReasoningEffort}',
+      to_jsonb(:'thinking_level'::text),
+      true
+    ),
+    updated_at = now()
+  where a.id = :'agent_id'::uuid
+  returning
+    a.id,
+    a.name,
+    a.role,
+    a.adapter_type,
+    coalesce(a.adapter_config->>'modelReasoningEffort', '') as reasoning_effort
+)
+select id, name, role, adapter_type, reasoning_effort
+from updated
+order by name;
+SQL
+  fi
+}
+
+update_agent_heartbeat_interval() {
+  local interval_sec="$1"
+  local include_reports="$2"
+
+  if [[ "$include_reports" == "1" ]]; then
+    psql_paperclip -v ON_ERROR_STOP=1 -v agent_id="$TARGET_AGENT_ID" -v interval_sec="$interval_sec" -At -F $'\t' <<'SQL'
+with recursive subtree as (
+  select a.id, a.company_id
+  from agents a
+  where a.id = :'agent_id'::uuid
+
+  union all
+
+  select a.id, a.company_id
+  from agents a
+  join subtree on a.reports_to = subtree.id and a.company_id = subtree.company_id
+),
+updated as (
+  update agents a
+  set
+    runtime_config = jsonb_set(
+      jsonb_set(
+        coalesce(a.runtime_config, '{}'::jsonb),
+        '{heartbeat,intervalSec}',
+        to_jsonb(:'interval_sec'::int),
+        true
+      ),
+      '{heartbeat,enabled}',
+      to_jsonb(true),
+      true
+    ),
+    updated_at = now()
+  from subtree
+  where a.id = subtree.id
+  returning
+    a.id,
+    a.name,
+    a.role,
+    a.adapter_type,
+    coalesce(a.runtime_config->'heartbeat'->>'intervalSec', '') as interval_sec,
+    coalesce(a.runtime_config->'heartbeat'->>'enabled', '') as heartbeat_enabled
+)
+select id, name, role, adapter_type, interval_sec, heartbeat_enabled
+from updated
+order by name;
+SQL
+  else
+    psql_paperclip -v ON_ERROR_STOP=1 -v agent_id="$TARGET_AGENT_ID" -v interval_sec="$interval_sec" -At -F $'\t' <<'SQL'
+with updated as (
+  update agents a
+  set
+    runtime_config = jsonb_set(
+      jsonb_set(
+        coalesce(a.runtime_config, '{}'::jsonb),
+        '{heartbeat,intervalSec}',
+        to_jsonb(:'interval_sec'::int),
+        true
+      ),
+      '{heartbeat,enabled}',
+      to_jsonb(true),
+      true
+    ),
+    updated_at = now()
+  where a.id = :'agent_id'::uuid
+  returning
+    a.id,
+    a.name,
+    a.role,
+    a.adapter_type,
+    coalesce(a.runtime_config->'heartbeat'->>'intervalSec', '') as interval_sec,
+    coalesce(a.runtime_config->'heartbeat'->>'enabled', '') as heartbeat_enabled
+)
+select id, name, role, adapter_type, interval_sec, heartbeat_enabled
+from updated
+order by name;
+SQL
+  fi
+}
+
+agent_heartbeat_set() {
+  local agent_ref="${1:-}"
+  local interval_raw="${2:-}"
+  local interval_sec
+  local include_reports="1"
+  local dry_run="0"
+  local scope_mode="self-and-reports"
+  local scope_mode_explicit="0"
+  local scope_rows
+  local scope_count
+  local updated_rows
+  local updated_count
+  local id
+  local name
+  local role
+  local adapter_type
+  local current_interval
+  local heartbeat_enabled
+
+  [[ -n "$agent_ref" ]] || {
+    agent_usage
+    fail "Missing agent name or id"
+  }
+  [[ -n "$interval_raw" ]] || {
+    agent_usage
+    fail "Missing heartbeat interval"
+  }
+
+  shift 2
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --self)
+        if [[ "$scope_mode" == "self-and-reports" && "$scope_mode_explicit" == "1" ]]; then
+          fail "Use either --self or --self-and-reports, not both"
+        fi
+        include_reports="0"
+        scope_mode="self"
+        scope_mode_explicit="1"
+        ;;
+      --self-and-reports|--include-reports)
+        if [[ "$scope_mode" == "self" && "$scope_mode_explicit" == "1" ]]; then
+          fail "Use either --self or --self-and-reports, not both"
+        fi
+        include_reports="1"
+        scope_mode="self-and-reports"
+        scope_mode_explicit="1"
+        ;;
+      --dry-run)
+        dry_run="1"
+        ;;
+      -h|--help)
+        agent_usage
+        return 0
+        ;;
+      *)
+        fail "Unknown option: $1"
+        ;;
+    esac
+    shift
+  done
+
+  interval_sec="$(normalize_heartbeat_interval "$interval_raw")"
+  require_running_instance
+  resolve_agent_target "$agent_ref"
+
+  scope_rows="$(query_agent_heartbeat_scope "$include_reports")"
+  scope_count="$(count_lines "$scope_rows")"
+
+  log "Target: $TARGET_AGENT_NAME"
+  log "Heartbeat interval: $(format_interval_label "$interval_sec")"
+  if [[ "$include_reports" == "1" ]]; then
+    log "Scope: self and reports ($scope_count agents)"
+  else
+    log "Scope: self only"
+  fi
+  print_agent_heartbeat_scope "$scope_rows"
+
+  if [[ "$dry_run" == "1" ]]; then
+    log "Dry run only. No changes applied."
+    return 0
+  fi
+
+  updated_rows="$(update_agent_heartbeat_interval "$interval_sec" "$include_reports")"
+  updated_count="$(count_lines "$updated_rows")"
+
+  if [[ "$updated_count" == "0" ]]; then
+    fail "No agents were updated"
+  fi
+
+  log "Updated $updated_count agent(s):"
+  while IFS=$'\t' read -r id name role adapter_type current_interval heartbeat_enabled; do
+    [[ -n "$id" ]] || continue
+    printf '  - %s adapter=%s heartbeat=%s enabled=%s\n' \
+      "$name" \
+      "$adapter_type" \
+      "$(format_interval_label "$current_interval")" \
+      "$(display_value "$heartbeat_enabled")"
+  done <<<"$updated_rows"
+}
+
+agent_thinking_set() {
+  local agent_ref="${1:-}"
+  local thinking_level_raw="${2:-}"
+  local thinking_level
+  local include_reports="1"
+  local dry_run="0"
+  local scope_mode="self-and-reports"
+  local scope_mode_explicit="0"
+  local scope_rows
+  local scope_count
+  local updated_rows
+  local updated_count
+  local id
+  local name
+  local role
+  local adapter_type
+  local reasoning_effort
+
+  [[ -n "$agent_ref" ]] || {
+    agent_usage
+    fail "Missing agent name or id"
+  }
+  [[ -n "$thinking_level_raw" ]] || {
+    agent_usage
+    fail "Missing thinking level"
+  }
+
+  shift 2
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --self)
+        if [[ "$scope_mode" == "self-and-reports" && "${scope_mode_explicit:-0}" == "1" ]]; then
+          fail "Use either --self or --self-and-reports, not both"
+        fi
+        include_reports="0"
+        scope_mode="self"
+        scope_mode_explicit="1"
+        ;;
+      --self-and-reports|--include-reports)
+        if [[ "$scope_mode" == "self" && "${scope_mode_explicit:-0}" == "1" ]]; then
+          fail "Use either --self or --self-and-reports, not both"
+        fi
+        include_reports="1"
+        scope_mode="self-and-reports"
+        scope_mode_explicit="1"
+        ;;
+      --dry-run)
+        dry_run="1"
+        ;;
+      -h|--help)
+        agent_usage
+        return 0
+        ;;
+      *)
+        fail "Unknown option: $1"
+        ;;
+    esac
+    shift
+  done
+
+  thinking_level="$(normalize_thinking_level "$thinking_level_raw")"
+  require_running_instance
+  resolve_agent_target "$agent_ref"
+
+  scope_rows="$(query_agent_scope "$include_reports")"
+  scope_count="$(count_lines "$scope_rows")"
+
+  log "Target: $TARGET_AGENT_NAME"
+  log "Thinking level: $thinking_level"
+  if [[ "$include_reports" == "1" ]]; then
+    log "Scope: self and reports ($scope_count agents)"
+  else
+    log "Scope: self only"
+  fi
+  print_agent_scope "$scope_rows"
+
+  if [[ "$dry_run" == "1" ]]; then
+    log "Dry run only. No changes applied."
+    return 0
+  fi
+
+  updated_rows="$(update_agent_thinking_level "$thinking_level" "$include_reports")"
+  updated_count="$(count_lines "$updated_rows")"
+
+  if [[ "$updated_count" == "0" ]]; then
+    fail "No agents were updated"
+  fi
+
+  log "Updated $updated_count agent(s):"
+  while IFS=$'\t' read -r id name role adapter_type reasoning_effort; do
+    [[ -n "$id" ]] || continue
+    printf '  - %s adapter=%s thinking=%s\n' "$name" "$adapter_type" "${reasoning_effort:-<unset>}"
+  done <<<"$updated_rows"
+}
+
+run_agent_command() {
+  local topic="${1:-}"
+  local action="${2:-}"
+
+  case "$topic" in
+    list)
+      shift 1
+      agent_list "$@"
+      ;;
+    heartbeat)
+      case "$action" in
+        set)
+          shift 2
+          agent_heartbeat_set "$@"
+          ;;
+        ""|-h|--help)
+          agent_usage
+          ;;
+        *)
+          fail "Unknown agent heartbeat command: $action"
+          ;;
+      esac
+      ;;
+    thinking)
+      case "$action" in
+        set)
+          shift 2
+          agent_thinking_set "$@"
+          ;;
+        ""|-h|--help)
+          agent_usage
+          ;;
+        *)
+          fail "Unknown agent thinking command: $action"
+          ;;
+      esac
+      ;;
+    ""|-h|--help)
+      agent_usage
+      ;;
+    *)
+      fail "Unknown agent command: $topic"
+      ;;
+  esac
+}
+
+cmd="${1:-}"
+case "$cmd" in
+  start)
+    start_daemon
+    ;;
+  stop)
+    stop_daemon
+    ;;
+  status)
+    show_status
+    ;;
+  doctor)
+    doctor
+    ;;
+  agent|agents)
+    shift
+    run_agent_command "$@"
+    ;;
+  *)
+    usage
+    exit 1
+    ;;
+esac
